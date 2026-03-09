@@ -298,7 +298,7 @@ for hoja in wb_ica.sheetnames:
     for row in ws.iter_rows():
         ws.row_dimensions[row[0].row].height = 25
 wb_ica.save(salida_ica)
-print("Archivo NADF-009 (ICA) generado con colores.")
+print("Archivo NADF-009 (ICA) generado.")
 
 # ----------------------------------------------------------------------------
 # 2. Archivo AIRE Y SALUD horario (NOM-172)
