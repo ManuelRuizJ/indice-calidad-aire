@@ -143,19 +143,27 @@ def peor_categoria(series_categorias):
 def combinar_con_existente(df_nuevo, archivo, col_fecha):
     """Combina df_nuevo (con indice de fecha) con el archivo excel existente (si existe)."""
     df_nuevo.index = pd.to_datetime(df_nuevo.index)
+    df_nuevo.index.name = col_fecha
     if os.path.exists(archivo):
-        df_existente = pd.read_excel(archivo, sheet_name=0, index_col=col_fecha, parse_dates=True)
+        try:
+            df_existente = pd.read_excel(archivo, sheet_name=0, index_col=col_fecha, parse_dates=True)
+        except ValueError as e:
+            if f"'{col_fecha}' is not in list" in str(e):
+                print(f"ADVERTENCIA: El archivo {archivo} no tiene la columna '{col_fecha}'. Se sobrescribirá.")
+                return df_nuevo
+            else:
+                raise
         df_existente.index = pd.to_datetime(df_existente.index)
         df_combinado = pd.concat([df_existente, df_nuevo], axis=0, sort=False)
         df_combinado = df_combinado[~df_combinado.index.duplicated(keep='last')]
         df_combinado.sort_index(inplace=True)
+        return df_combinado
     else:
-        df_combinado = df_nuevo
-    return df_combinado
+        return df_nuevo
 
 def guardar_ica_por_estacion(df, archivo):
     """Guarda DataFrame de ICA en Excel con hoja general y hojas por estacion, aplicando colores."""
-    # Obtener lista de estaciones unicas
+    df.index.name = 'Fecha & Hora'  # <-- AÑADIDO
     estaciones = set()
     for col in df.columns:
         if col.startswith('ICA_'):
@@ -163,39 +171,15 @@ def guardar_ica_por_estacion(df, archivo):
             if len(partes) == 3:
                 estaciones.add(partes[2])
     with pd.ExcelWriter(archivo, engine='openpyxl') as writer:
-        # Hoja general
         df.to_excel(writer, sheet_name='General', index=True)
-        # Hojas por estacion
         for estacion in sorted(estaciones):
             cols_estacion = [c for c in df.columns if c.endswith(estacion)] + [df.index.name]
             df_estacion = df[cols_estacion].copy()
             df_estacion.to_excel(writer, sheet_name=estacion[:31], index=True)
-    # Aplicar formato a todas las hojas
-    wb = load_workbook(archivo)
-    for hoja in wb.sheetnames:
-        ws = wb[hoja]
-        # Formato general
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-        # Colores ICA
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                if cell.column > 1 and isinstance(cell.value, (int, float)) and not pd.isna(cell.value):
-                    color = obtener_color_ica(int(cell.value))
-                    if color:
-                        cell.fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
-        # Ajustar ancho
-        for col in ws.columns:
-            max_len = max((len(str(cell.value)) for cell in col if cell.value), default=0)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 50)
-        for row in ws.iter_rows():
-            ws.row_dimensions[row[0].row].height = 25
-    wb.save(archivo)
 
 def guardar_aire_por_estacion(df, archivo):
+    """Guarda DataFrame de AIRE Y SALUD horario con hojas por estacion y formato."""
+    df.index.name = 'Fecha & Hora'
     """Guarda DataFrame de AIRE Y SALUD horario con hojas por estacion y formato."""
     # Identificar columnas de categoria y cantidad
     cols_categoria = [c for c in df.columns if c.startswith('AIRE_') and not c.startswith('CANTIDAD')]
@@ -268,8 +252,9 @@ def guardar_aire_por_estacion(df, archivo):
     wb.save(archivo)
 
 def guardar_diario_por_estacion(df, archivo):
-    """Guarda DataFrame diario con hojas por estacion (similar a AIRE Y SALUD)."""
-    guardar_aire_por_estacion(df, archivo)  # Reutilizamos la misma funcion, ya que la estructura es identica
+    """Guarda DataFrame diario con hojas por estacion."""
+    df.index.name = 'Fecha'  # <-- AÑADIDO
+    guardar_aire_por_estacion(df, archivo) # Reutilizamos la misma funcion, ya que la estructura es identica
 
 # ============================================================================
 # PROCESAMIENTO PRINCIPAL
