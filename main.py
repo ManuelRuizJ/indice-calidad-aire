@@ -173,14 +173,13 @@ def guardar_ica_por_estacion(df, archivo):
     with pd.ExcelWriter(archivo, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='General', index=True)
         for estacion in sorted(estaciones):
-            cols_estacion = [c for c in df.columns if c.endswith(estacion)] + [df.index.name]
+            cols_estacion = [c for c in df.columns if c.endswith(estacion)]  # <-- CORREGIDO: sin el nombre del índice
             df_estacion = df[cols_estacion].copy()
             df_estacion.to_excel(writer, sheet_name=estacion[:31], index=True)
 
 def guardar_aire_por_estacion(df, archivo):
     """Guarda DataFrame de AIRE Y SALUD horario con hojas por estacion y formato."""
     df.index.name = 'Fecha & Hora'
-    """Guarda DataFrame de AIRE Y SALUD horario con hojas por estacion y formato."""
     # Identificar columnas de categoria y cantidad
     cols_categoria = [c for c in df.columns if c.startswith('AIRE_') and not c.startswith('CANTIDAD')]
     cols_cantidad = [c for c in df.columns if c.startswith('CANTIDAD_')]
@@ -195,7 +194,7 @@ def guardar_aire_por_estacion(df, archivo):
         df.to_excel(writer, sheet_name='General', index=True)
         # Hojas por estacion
         for estacion in sorted(estaciones):
-            cols_estacion = [c for c in df.columns if c.endswith(estacion) or c == df.index.name or c == 'Calidad del aire']
+            cols_estacion = [c for c in df.columns if c.endswith(estacion) or c == 'Calidad del aire']  # <-- CORREGIDO: sin el nombre del índice
             df_estacion = df[cols_estacion].copy()
             df_estacion.to_excel(writer, sheet_name=estacion[:31], index=True)
     # Aplicar formato
