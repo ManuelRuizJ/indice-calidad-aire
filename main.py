@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import re
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Alignment, Font
 from openpyxl.utils import get_column_letter
@@ -158,16 +159,81 @@ def combinar_con_existente(df_nuevo, archivo, nombre_hoja, col_fecha):
     """
     if os.path.exists(archivo):
         try:
-            df_existente = pd.read_excel(archivo, sheet_name=nombre_hoja, index_col=col_fecha)
+            # Leer con motor explicit para evitar problemas de extension
+            df_existente = pd.read_excel(archivo, sheet_name=nombre_hoja, engine='openpyxl')
+            # Intentar establecer el indice con la columna de fecha
+            if col_fecha in df_existente.columns:
+                df_existente.set_index(col_fecha, inplace=True)
+            else:
+                # Si no esta, asumir que la primera columna es la fecha
+                df_existente.set_index(df_existente.columns[0], inplace=True)
+                df_existente.index.name = col_fecha
+            # Combinar
             df_combinado = pd.concat([df_existente, df_nuevo], axis=0, sort=False)
             df_combinado = df_combinado[~df_combinado.index.duplicated(keep='last')]
             df_combinado.sort_index(inplace=True)
             return df_combinado
-        except ValueError:
-            # La hoja no existe, solo devolvemos el nuevo
+        except (ValueError, KeyError, pd.errors.EmptyDataError, Exception) as e:
+            # Si hay error (hoja no existe, archivo corrupto, etc.), retornar el nuevo
+            print(f"Advertencia: No se pudo leer hoja '{nombre_hoja}' de {archivo}. Se creara nueva. Error: {e}")
             return df_nuevo
     else:
         return df_nuevo
+
+def ordenar_columnas_aire(df):
+    """
+    Reordena las columnas de un DataFrame de AIRE Y SALUD para que queden intercaladas:
+    para cada contaminante y estacion, primero la columna de categoria (AIRE_*)
+    y luego la de cantidad (CANTIDAD_*), y al final 'Calidad del aire' si existe.
+    """
+    # Extraer todos los pares (contaminante, estacion) de las columnas que empiezan con AIRE_ y no son CANTIDAD
+    patron = re.compile(r'^AIRE_(\w+)_(.+)$')
+    pares = set()
+    for col in df.columns:
+        if col.startswith('AIRE_') and 'CANTIDAD' not in col:
+            m = patron.match(col)
+            if m:
+                contaminante = m.group(1)
+                estacion = m.group(2)
+                pares.add((contaminante, estacion))
+    # Ordenar pares por estacion y luego contaminante
+    pares_ordenados = sorted(pares, key=lambda x: (x[1], x[0]))
+    # Construir lista de columnas intercaladas
+    cols_ordenadas = []
+    for contaminante, estacion in pares_ordenados:
+        col_cat = f"AIRE_{contaminante}_{estacion}"
+        col_cant = f"CANTIDAD_{contaminante}_{estacion}"
+        if col_cat in df.columns:
+            cols_ordenadas.append(col_cat)
+        if col_cant in df.columns:
+            cols_ordenadas.append(col_cant)
+    # Añadir Calidad del aire si existe
+    if 'Calidad del aire' in df.columns:
+        cols_ordenadas.append('Calidad del aire')
+    # Asegurar que no falten columnas (las que no esten en la lista se añaden al final)
+    resto = [c for c in df.columns if c not in cols_ordenadas]
+    return cols_ordenadas + resto
+
+def ordenar_columnas_ica(df):
+    """
+    Reordena las columnas de un DataFrame de ICA por estacion y contaminante.
+    Las columnas tienen formato ICA_contaminante_estacion.
+    """
+    # Extraer todos los pares (contaminante, estacion)
+    patron = re.compile(r'^ICA_(\w+)_(.+)$')
+    pares = set()
+    for col in df.columns:
+        m = patron.match(col)
+        if m:
+            contaminante = m.group(1)
+            estacion = m.group(2)
+            pares.add((contaminante, estacion))
+    # Ordenar por estacion y luego contaminante
+    pares_ordenados = sorted(pares, key=lambda x: (x[1], x[0]))
+    cols_ordenadas = [f"ICA_{contaminante}_{estacion}" for contaminante, estacion in pares_ordenados]
+    # Añadir columnas que no coincidan (por si acaso)
+    resto = [c for c in df.columns if c not in cols_ordenadas]
+    return cols_ordenadas + resto
 
 def extraer_estaciones(df, tipo):
     """
@@ -200,6 +266,28 @@ def extraer_estaciones(df, tipo):
         if cols_cat:
             series_cat = [df_est[col] for col in cols_cat]
             df_est['Calidad del aire'] = peor_categoria(series_cat, SUFICIENCIA)
+        # Reordenar columnas de la estacion para que queden intercaladas
+        # Para ello, usamos la misma logica que en ordenar_columnas_aire pero restringida a esta estacion
+        # Generamos la lista de pares solo para esta estacion
+        patron = re.compile(r'^AIRE_(\w+)_' + re.escape(est) + r'$')
+        pares = []
+        for col in cols_cat:
+            m = patron.match(col)
+            if m:
+                contaminante = m.group(1)
+                pares.append(contaminante)
+        pares_ordenados = sorted(pares)
+        cols_ordenadas_est = []
+        for contaminante in pares_ordenados:
+            col_cat = f"AIRE_{contaminante}_{est}"
+            col_cant = f"CANTIDAD_{contaminante}_{est}"
+            if col_cat in df_est.columns:
+                cols_ordenadas_est.append(col_cat)
+            if col_cant in df_est.columns:
+                cols_ordenadas_est.append(col_cant)
+        if 'Calidad del aire' in df_est.columns:
+            cols_ordenadas_est.append('Calidad del aire')
+        df_est = df_est[cols_ordenadas_est]
         dfs_estacion[est] = df_est
     return dfs_estacion
 
@@ -271,13 +359,16 @@ def aplicar_formato_aire(ws):
     for row in ws.iter_rows():
         ws.row_dimensions[row[0].row].height = 25
 
-def guardar_diccionario_excel(archivo, diccionario_dfs, tipo):
+def guardar_diccionario_excel(archivo, diccionario_dfs, tipo, nombre_indice):
     """
     Guarda un diccionario de DataFrames en un archivo Excel, cada uno en una hoja.
     tipo: 'ICA', 'AIRE' o 'DIARIO' para aplicar el formato adecuado.
+    nombre_indice: nombre que se asignara a la columna de indice (fecha).
     """
     with pd.ExcelWriter(archivo, engine='openpyxl') as writer:
         for nombre_hoja, df in diccionario_dfs.items():
+            # Asignar nombre al indice antes de guardar
+            df.index.name = nombre_indice
             # Limitar nombre de hoja a 31 caracteres
             nombre_hoja = nombre_hoja[:31]
             df.to_excel(writer, sheet_name=nombre_hoja, index=True)
@@ -358,10 +449,12 @@ for hoja in xls.sheet_names:
 
 # Combinar con existente (hoja General)
 df_ica_general = combinar_con_existente(df_ica_total, salida_ica, 'General', 'Fecha & Hora')
+# Reordenar columnas de ICA
+df_ica_general = df_ica_general[ordenar_columnas_ica(df_ica_general)]
+
 # Crear diccionario de hojas: General + estaciones (para ICA no hay columna de calidad)
 diccionario_ica = {'General': df_ica_general}
-# Para ICA no se calcula calidad del aire, asi que extraemos sin ese paso
-# Usamos una version simplificada de extraer_estaciones sin calcular calidad
+# Extraer estaciones manualmente
 estaciones_ica = set()
 for col in df_ica_general.columns:
     if col.startswith('ICA_'):
@@ -372,8 +465,12 @@ for col in df_ica_general.columns:
 for est in sorted(estaciones_ica):
     cols_est = [c for c in df_ica_general.columns if c.endswith(est)]
     diccionario_ica[est] = df_ica_general[cols_est].copy()
+    # Tambien reordenar las columnas de la hoja de estacion (aunque ya vienen en el orden del general)
+    # Para mantener consistencia, aplicamos el mismo orden que en general, pero solo con esas columnas
+    # Como ya estan en orden, no es necesario, pero podemos asegurar:
+    diccionario_ica[est] = diccionario_ica[est][[c for c in df_ica_general.columns if c.endswith(est)]]
 
-guardar_diccionario_excel(salida_ica, diccionario_ica, 'ICA')
+guardar_diccionario_excel(salida_ica, diccionario_ica, 'ICA', 'Fecha & Hora')
 print("Archivo ICA generado/actualizado con hojas por estacion.")
 
 # ----------------------------------------------------------------------------
@@ -437,21 +534,22 @@ for hoja in xls.sheet_names:
     if not df_hoja.empty:
         df_aire_total = pd.concat([df_aire_total, df_hoja], axis=0)
 
-# Calcular calidad global para la hoja General (sin umbral, con todas las categorias)
+# Calcular calidad global para la hoja General (sin umbral)
 if not df_aire_total.empty:
     cols_cat = [c for c in df_aire_total.columns if c.startswith('AIRE_') and 'CANTIDAD' not in c]
     if cols_cat:
         series_cat = [df_aire_total[col] for col in cols_cat]
-        # Para la hoja General, no aplicamos umbral (o aplicamos uno muy bajo)
-        # Usamos la misma funcion pero con umbral 0 para que siempre calcule
         df_aire_total['Calidad del aire'] = peor_categoria(series_cat, 0.0)
 
 # Combinar con existente
 df_aire_general = combinar_con_existente(df_aire_total, salida_aire, 'General', 'Fecha & Hora')
+# Reordenar columnas de AIRE Y SALUD
+df_aire_general = df_aire_general[ordenar_columnas_aire(df_aire_general)]
+
 # Extraer hojas por estacion (con su propia calidad)
 diccionario_aire = {'General': df_aire_general}
 diccionario_aire.update(extraer_estaciones(df_aire_general, 'AIRE'))
-guardar_diccionario_excel(salida_aire, diccionario_aire, 'AIRE')
+guardar_diccionario_excel(salida_aire, diccionario_aire, 'AIRE', 'Fecha & Hora')
 print("Archivo AIRE Y SALUD horario generado/actualizado con hojas por estacion.")
 
 # ----------------------------------------------------------------------------
@@ -531,7 +629,10 @@ if not df_diario_total.empty:
 
 # Combinar con existente
 df_diario_general = combinar_con_existente(df_diario_total, salida_diario, 'General', 'Fecha')
+# Reordenar columnas de DIARIO (misma logica que AIRE)
+df_diario_general = df_diario_general[ordenar_columnas_aire(df_diario_general)]
+
 diccionario_diario = {'General': df_diario_general}
 diccionario_diario.update(extraer_estaciones(df_diario_general, 'DIARIO'))
-guardar_diccionario_excel(salida_diario, diccionario_diario, 'DIARIO')
+guardar_diccionario_excel(salida_diario, diccionario_diario, 'DIARIO', 'Fecha')
 print("Archivo DIARIO generado/actualizado con hojas por estacion.")
