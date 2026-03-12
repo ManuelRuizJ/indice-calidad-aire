@@ -107,14 +107,33 @@ def obtener_color_ica(valor):
     return None
 
 def preparar_datos_hoja(df):
-    """Convierte las primeras filas en metadatos y reindexa a frecuencia horaria."""
+    """Convierte las primeras filas en metadatos y reindexa a frecuencia horaria.
+       Maneja correctamente las horas 24:00 convirtiéndolas a 00:00 del día siguiente.
+    """
     estaciones = df.iloc[0].values
     contaminantes = df.iloc[1].values
     unidades = df.iloc[2].values
     datos_raw = df.iloc[3:].reset_index(drop=True)
 
-    dates_raw = datos_raw.iloc[:, 0]
-    dates = pd.to_datetime(dates_raw, errors='coerce', dayfirst=True)
+    dates_raw = datos_raw.iloc[:, 0].astype(str)
+    # Dividir fecha y hora
+    parts = dates_raw.str.split(' ', expand=True)
+    if parts.shape[1] >= 2:
+        fecha_str = parts[0]
+        hora_str = parts[1]
+        # Identificar las que tienen hora 24:00
+        mask_24 = hora_str == '24:00'
+        # Reemplazar 24:00 por 00:00
+        hora_str = hora_str.replace('24:00', '00:00')
+        # Reconstruir cadena
+        dates_raw_corr = fecha_str + ' ' + hora_str
+        # Convertir a datetime
+        dates = pd.to_datetime(dates_raw_corr, errors='coerce', dayfirst=True)
+        # Sumar un día a las que eran 24:00
+        dates = dates + pd.Timedelta(days=1) * mask_24
+    else:
+        dates = pd.to_datetime(dates_raw, errors='coerce', dayfirst=True)
+
     if dates.isna().any():
         print(f"ADVERTENCIA: {dates.isna().sum()} filas con fecha no valida seran descartadas.")
         datos_raw = datos_raw.loc[~dates.isna()]
@@ -155,31 +174,29 @@ def peor_categoria(series_categorias, umbral_suficiencia=0.75):
 def combinar_con_existente(df_nuevo, archivo, nombre_hoja, col_fecha):
     """
     Lee la hoja 'nombre_hoja' del archivo existente (si existe) y la combina con df_nuevo.
-    Retorna el DataFrame combinado (con indice de fecha).
+    Convierte el indice a Timestamp si es necesario.
     """
     if os.path.exists(archivo):
         try:
-            # Leer con motor explicit para evitar problemas de extension
             df_existente = pd.read_excel(archivo, sheet_name=nombre_hoja, engine='openpyxl')
-            # Intentar establecer el indice con la columna de fecha
             if col_fecha in df_existente.columns:
                 df_existente.set_index(col_fecha, inplace=True)
             else:
-                # Si no esta, asumir que la primera columna es la fecha
                 df_existente.set_index(df_existente.columns[0], inplace=True)
                 df_existente.index.name = col_fecha
-            # Combinar
+            # Convertir indice a Timestamp si es date
+            if not isinstance(df_existente.index, pd.DatetimeIndex):
+                df_existente.index = pd.to_datetime(df_existente.index)
             df_combinado = pd.concat([df_existente, df_nuevo], axis=0, sort=False)
             df_combinado = df_combinado[~df_combinado.index.duplicated(keep='last')]
             df_combinado.sort_index(inplace=True)
             return df_combinado
-        except (ValueError, KeyError, pd.errors.EmptyDataError, Exception) as e:
-            # Si hay error (hoja no existe, archivo corrupto, etc.), retornar el nuevo
+        except Exception as e:
             print(f"Advertencia: No se pudo leer hoja '{nombre_hoja}' de {archivo}. Se creara nueva. Error: {e}")
             return df_nuevo
     else:
         return df_nuevo
-
+    
 def ordenar_columnas_aire(df):
     """
     Reordena las columnas de un DataFrame de AIRE Y SALUD para que queden intercaladas:
@@ -210,7 +227,7 @@ def ordenar_columnas_aire(df):
     # Añadir Calidad del aire si existe
     if 'Calidad del aire' in df.columns:
         cols_ordenadas.append('Calidad del aire')
-    # Asegurar que no falten columnas (las que no esten en la lista se añaden al final)
+    # Asegurar que no falten columnas (las que no estén en la lista se añaden al final)
     resto = [c for c in df.columns if c not in cols_ordenadas]
     return cols_ordenadas + resto
 
@@ -267,8 +284,6 @@ def extraer_estaciones(df, tipo):
             series_cat = [df_est[col] for col in cols_cat]
             df_est['Calidad del aire'] = peor_categoria(series_cat, SUFICIENCIA)
         # Reordenar columnas de la estacion para que queden intercaladas
-        # Para ello, usamos la misma logica que en ordenar_columnas_aire pero restringida a esta estacion
-        # Generamos la lista de pares solo para esta estacion
         patron = re.compile(r'^AIRE_(\w+)_' + re.escape(est) + r'$')
         pares = []
         for col in cols_cat:
@@ -367,7 +382,8 @@ def guardar_diccionario_excel(archivo, diccionario_dfs, tipo, nombre_indice):
     """
     with pd.ExcelWriter(archivo, engine='openpyxl') as writer:
         for nombre_hoja, df in diccionario_dfs.items():
-            # Asignar nombre al indice antes de guardar
+            # Asegurar que el índice sea datetime y asignar nombre
+            df.index = pd.to_datetime(df.index)
             df.index.name = nombre_indice
             # Limitar nombre de hoja a 31 caracteres
             nombre_hoja = nombre_hoja[:31]
@@ -465,9 +481,7 @@ for col in df_ica_general.columns:
 for est in sorted(estaciones_ica):
     cols_est = [c for c in df_ica_general.columns if c.endswith(est)]
     diccionario_ica[est] = df_ica_general[cols_est].copy()
-    # Tambien reordenar las columnas de la hoja de estacion (aunque ya vienen en el orden del general)
-    # Para mantener consistencia, aplicamos el mismo orden que en general, pero solo con esas columnas
-    # Como ya estan en orden, no es necesario, pero podemos asegurar:
+    # También reordenar las columnas de la hoja de estación (ya vienen en el orden del general)
     diccionario_ica[est] = diccionario_ica[est][[c for c in df_ica_general.columns if c.endswith(est)]]
 
 guardar_diccionario_excel(salida_ica, diccionario_ica, 'ICA', 'Fecha & Hora')
@@ -564,7 +578,8 @@ for hoja in xls.sheet_names:
 
     data_df['Fecha_dia'] = data_df.index.date
     dias = data_df['Fecha_dia'].unique()
-    dias_ordenados = sorted(dias)
+    # Convertir a datetime para tener índice homogéneo
+    dias_ordenados = sorted(pd.to_datetime(dias))
     df_dia = pd.DataFrame(index=dias_ordenados)
 
     for i in range(1, num_orig_cols):
