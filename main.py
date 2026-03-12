@@ -27,7 +27,7 @@ SUFICIENCIA = config['suficiencia']
 ORDEN_CATEGORIAS = config['orden_categorias']
 
 # ============================================================================
-# FUNCIONES AUXILIARES (sin cambios funcionales, solo se usa la configuracion cargada)
+# FUNCIONES AUXILIARES
 # ============================================================================
 
 def calcular_ica(conc, bandas):
@@ -131,73 +131,165 @@ def preparar_datos_hoja(df):
         print(f"INFO: Se agregaron {len(gaps)} horas faltantes (NaN).")
     return estaciones, contaminantes, unidades, data_df, len(df.columns)
 
-def peor_categoria(series_categorias):
+def peor_categoria(series_categorias, umbral_suficiencia=0.75):
+    """
+    Dadas varias series de categorias, devuelve la peor (mayor riesgo) por fila,
+    solo si al menos el `umbral_suficiencia` de las series tienen datos no nulos.
+    En caso contrario, retorna None.
+    """
     if not series_categorias:
         return pd.Series(index=pd.Index([]), dtype='object')
     df_cat = pd.concat(series_categorias, axis=1)
+    # Contar cuantas columnas tienen datos no nulos por fila
+    count_valid = df_cat.notna().sum(axis=1)
+    min_requerido = int(np.ceil(len(series_categorias) * umbral_suficiencia))
+    # Convertir a valores numericos
     df_num = df_cat.apply(lambda col: col.map(ORDEN_CATEGORIAS).fillna(-1))
     max_num = df_num.max(axis=1)
+    # Solo mantener donde hay suficiencia
+    max_num = max_num.where(count_valid >= min_requerido, -1)
     inverso = {v: k for k, v in ORDEN_CATEGORIAS.items()}
     return max_num.map(inverso).where(max_num >= 0, None)
 
-def combinar_con_existente(df_nuevo, archivo, col_fecha):
-    """Combina df_nuevo (con indice de fecha) con el archivo excel existente (si existe)."""
+def combinar_con_existente(df_nuevo, archivo, nombre_hoja, col_fecha):
+    """
+    Lee la hoja 'nombre_hoja' del archivo existente (si existe) y la combina con df_nuevo.
+    Retorna el DataFrame combinado (con indice de fecha).
+    """
     if os.path.exists(archivo):
-        df_existente = pd.read_excel(archivo, sheet_name=0, index_col=col_fecha)
-        # Alinear columnas (pueden diferir si hay nuevas estaciones)
-        df_combinado = pd.concat([df_existente, df_nuevo], axis=0, sort=False)
-        # Eliminar duplicados de indice (conservar el ultimo, que seria el dato mas nuevo)
-        df_combinado = df_combinado[~df_combinado.index.duplicated(keep='last')]
-        df_combinado.sort_index(inplace=True)
+        try:
+            df_existente = pd.read_excel(archivo, sheet_name=nombre_hoja, index_col=col_fecha)
+            df_combinado = pd.concat([df_existente, df_nuevo], axis=0, sort=False)
+            df_combinado = df_combinado[~df_combinado.index.duplicated(keep='last')]
+            df_combinado.sort_index(inplace=True)
+            return df_combinado
+        except ValueError:
+            # La hoja no existe, solo devolvemos el nuevo
+            return df_nuevo
     else:
-        df_combinado = df_nuevo
-    return df_combinado
+        return df_nuevo
 
-def guardar_con_formato(df, archivo, col_fecha, colores_dict=None, columnas_color=None, es_diario=False):
-    """Guarda DataFrame en Excel con formato y colores."""
-    with pd.ExcelWriter(archivo, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Datos', index=True)
-    # Aplicar formato
-    wb = load_workbook(archivo)
-    ws = wb['Datos']
+def extraer_estaciones(df, tipo):
+    """
+    A partir de un DataFrame consolidado (con columnas como 'ICA_O3_Estacion' o 'AIRE_O3_Estacion'),
+    devuelve un diccionario {nombre_estacion: DataFrame_con_columnas_de_esa_estacion}.
+    Incluye la columna de fecha (indice). La columna 'Calidad del aire' se recalcula por estacion.
+    """
+    # Obtener lista de estaciones unicas
+    estaciones = set()
+    for col in df.columns:
+        if tipo == 'ICA' and col.startswith('ICA_'):
+            partes = col.split('_')
+            if len(partes) >= 3:
+                est = '_'.join(partes[2:])
+                estaciones.add(est)
+        elif tipo in ['AIRE', 'DIARIO'] and col.startswith('AIRE_'):
+            partes = col.split('_')
+            if len(partes) >= 3:
+                est = '_'.join(partes[2:])
+                estaciones.add(est)
+
+    dfs_estacion = {}
+    for est in sorted(estaciones):
+        # Columnas de categoria y cantidad que terminan con esta estacion
+        cols_cat = [c for c in df.columns if c.endswith(est) and 'CANTIDAD' not in c and c.startswith('AIRE_')]
+        cols_cant = [c for c in df.columns if c.endswith(est) and 'CANTIDAD' in c]
+        # Crear DataFrame con esas columnas
+        df_est = df[cols_cat + cols_cant].copy()
+        # Calcular calidad del aire para esta estacion
+        if cols_cat:
+            series_cat = [df_est[col] for col in cols_cat]
+            df_est['Calidad del aire'] = peor_categoria(series_cat, SUFICIENCIA)
+        dfs_estacion[est] = df_est
+    return dfs_estacion
+
+def aplicar_formato_ica(ws):
+    """Aplica formato y colores a una hoja de ICA."""
     for row in ws.iter_rows():
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
     for cell in ws[1]:
         cell.font = Font(bold=True)
-    # Aplicar colores a columnas de categoria si se especifican
-    if colores_dict and columnas_color:
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                if cell.column in columnas_color and cell.value in colores_dict:
-                    cell.fill = PatternFill(start_color=colores_dict[cell.value],
-                                            end_color=colores_dict[cell.value],
-                                            fill_type='solid')
-                    if cell.value in ['Buena', 'Aceptable']:
-                        cell.font = Font(bold=True, color='000000')
-                    else:
-                        cell.font = Font(bold=True, color='FFFFFF')
-    # Formato de numeros para columnas de cantidad
-    if not es_diario:
-        for col in ws.columns:
-            if col[0].value and isinstance(col[0].value, str) and col[0].value.startswith('CANTIDAD_'):
-                nombre = col[0].value
-                if 'O3' in nombre or 'NO2' in nombre or 'SO2' in nombre:
-                    fmt = '0.000'
-                elif 'CO' in nombre:
-                    fmt = '0.00'
-                else:
-                    fmt = '0'
-                for cell in col[1:]:
-                    if cell.value is not None:
-                        cell.number_format = fmt
-    # Ajustar ancho de columnas
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            if cell.column > 1 and isinstance(cell.value, (int, float)) and not pd.isna(cell.value):
+                color = obtener_color_ica(int(cell.value))
+                if color:
+                    cell.fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
     for col in ws.columns:
         max_len = max((len(str(cell.value)) for cell in col if cell.value), default=0)
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 50)
-    # Altura de filas
     for row in ws.iter_rows():
         ws.row_dimensions[row[0].row].height = 25
+
+def aplicar_formato_aire(ws):
+    """Aplica formato y colores a una hoja de AIRE Y SALUD (horario o diario)."""
+    # Identificar columnas de categoria (empiezan con 'AIRE_' y no son 'CANTIDAD_')
+    columnas_categoria = []
+    for col in ws.iter_cols(min_row=1, max_row=1):
+        if col[0].value and isinstance(col[0].value, str):
+            if col[0].value.startswith('AIRE_') and 'CANTIDAD' not in col[0].value:
+                columnas_categoria.append(col[0].column)
+            elif col[0].value == 'Calidad del aire':
+                columnas_categoria.append(col[0].column)
+
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    # Colorear celdas de categoria
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            if cell.column in columnas_categoria and cell.value in COLORES_NOM:
+                cell.fill = PatternFill(start_color=COLORES_NOM[cell.value],
+                                        end_color=COLORES_NOM[cell.value],
+                                        fill_type='solid')
+                if cell.value in ['Buena', 'Aceptable']:
+                    cell.font = Font(bold=True, color='000000')
+                else:
+                    cell.font = Font(bold=True, color='FFFFFF')
+
+    # Formato de numero para columnas de cantidad
+    for col in ws.columns:
+        if col[0].value and isinstance(col[0].value, str) and col[0].value.startswith('CANTIDAD_'):
+            nombre = col[0].value
+            if 'O3' in nombre or 'NO2' in nombre or 'SO2' in nombre:
+                fmt = '0.000'
+            elif 'CO' in nombre:
+                fmt = '0.00'
+            else:
+                fmt = '0'
+            for cell in col[1:]:
+                if cell.value is not None:
+                    cell.number_format = fmt
+
+    for col in ws.columns:
+        max_len = max((len(str(cell.value)) for cell in col if cell.value), default=0)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 50)
+    for row in ws.iter_rows():
+        ws.row_dimensions[row[0].row].height = 25
+
+def guardar_diccionario_excel(archivo, diccionario_dfs, tipo):
+    """
+    Guarda un diccionario de DataFrames en un archivo Excel, cada uno en una hoja.
+    tipo: 'ICA', 'AIRE' o 'DIARIO' para aplicar el formato adecuado.
+    """
+    with pd.ExcelWriter(archivo, engine='openpyxl') as writer:
+        for nombre_hoja, df in diccionario_dfs.items():
+            # Limitar nombre de hoja a 31 caracteres
+            nombre_hoja = nombre_hoja[:31]
+            df.to_excel(writer, sheet_name=nombre_hoja, index=True)
+
+    # Aplicar formato a cada hoja
+    wb = load_workbook(archivo)
+    for nombre_hoja in wb.sheetnames:
+        ws = wb[nombre_hoja]
+        if tipo == 'ICA':
+            aplicar_formato_ica(ws)
+        elif tipo == 'AIRE' or tipo == 'DIARIO':
+            aplicar_formato_aire(ws)
     wb.save(archivo)
 
 # ============================================================================
@@ -207,7 +299,6 @@ archivo_entrada = "datos/datos_calidad_aire.xlsx"
 salida_ica = "datos/datos_calidad_aire_ICA.xlsx"
 salida_aire = "datos/datos_calidad_aire_AIRE_Y_SALUD.xlsx"
 salida_diario = "datos/datos_calidad_aire_DIARIO.xlsx"
-salida_por_estacion = "datos/datos_calidad_aire_POR_ESTACION.xlsx"
 
 xls = pd.ExcelFile(archivo_entrada)
 
@@ -215,13 +306,12 @@ xls = pd.ExcelFile(archivo_entrada)
 # 1. Generar datos para ICA (NADF-009) en un DataFrame consolidado
 # ----------------------------------------------------------------------------
 print("Procesando datos para ICA...")
-df_ica_total = pd.DataFrame()  # acumulador de todas las hojas
+df_ica_total = pd.DataFrame()
 
 for hoja in xls.sheet_names:
     df = pd.read_excel(xls, sheet_name=hoja, header=None)
     estaciones, contaminantes, unidades, data_df, num_orig_cols = preparar_datos_hoja(df)
 
-    # Crear DataFrame para esta hoja con indice de fecha
     df_hoja = pd.DataFrame(index=data_df.index)
 
     for i in range(1, num_orig_cols):
@@ -240,13 +330,11 @@ for hoja in xls.sheet_names:
         ventana = VENTANAS_NADF[clave_orig]
         valores = pd.to_numeric(data_df.iloc[:, col_in_data], errors="coerce")
 
-        # Filtro de status
         if i + 1 < num_orig_cols:
             status_series = data_df.iloc[:, i]
             status_str = status_series.astype(str).str.strip().str.lower()
             valores = valores.where(status_str == "ok", np.nan)
 
-        # Descartar negativos
         valores = valores.where(valores >= 0, np.nan)
 
         if (valores == 0).all():
@@ -264,22 +352,35 @@ for hoja in xls.sheet_names:
         ica_lista = [calcular_ica(x, BANDAS_NADF[clave_bandas]) if not np.isnan(x) else np.nan for x in valores_prom]
         df_hoja[f"ICA_{contaminante}_{estacion}"] = ica_lista
 
-    # Eliminar filas completamente vacias de esta hoja
     df_hoja = df_hoja.dropna(how='all')
     if not df_hoja.empty:
         df_ica_total = pd.concat([df_ica_total, df_hoja], axis=0)
 
-# Consolidar con existente
-df_ica_total = combinar_con_existente(df_ica_total, salida_ica, col_fecha='Fecha & Hora')
-guardar_con_formato(df_ica_total, salida_ica, col_fecha='Fecha & Hora')
-print("Archivo ICA generado/actualizado.")
+# Combinar con existente (hoja General)
+df_ica_general = combinar_con_existente(df_ica_total, salida_ica, 'General', 'Fecha & Hora')
+# Crear diccionario de hojas: General + estaciones (para ICA no hay columna de calidad)
+diccionario_ica = {'General': df_ica_general}
+# Para ICA no se calcula calidad del aire, asi que extraemos sin ese paso
+# Usamos una version simplificada de extraer_estaciones sin calcular calidad
+estaciones_ica = set()
+for col in df_ica_general.columns:
+    if col.startswith('ICA_'):
+        partes = col.split('_')
+        if len(partes) >= 3:
+            est = '_'.join(partes[2:])
+            estaciones_ica.add(est)
+for est in sorted(estaciones_ica):
+    cols_est = [c for c in df_ica_general.columns if c.endswith(est)]
+    diccionario_ica[est] = df_ica_general[cols_est].copy()
+
+guardar_diccionario_excel(salida_ica, diccionario_ica, 'ICA')
+print("Archivo ICA generado/actualizado con hojas por estacion.")
 
 # ----------------------------------------------------------------------------
 # 2. Generar datos para AIRE Y SALUD horario (NOM-172)
 # ----------------------------------------------------------------------------
 print("Procesando datos para AIRE Y SALUD horario...")
 df_aire_total = pd.DataFrame()
-lista_categorias_total = []  # para calcular peor categoria global por hora (opcional)
 
 for hoja in xls.sheet_names:
     df = pd.read_excel(xls, sheet_name=hoja, header=None)
@@ -332,31 +433,26 @@ for hoja in xls.sheet_names:
         df_hoja[col_cat] = categorias
         df_hoja[col_conc] = conc_redondeada
 
-    # Eliminar filas completamente vacias
     df_hoja = df_hoja.dropna(how='all')
     if not df_hoja.empty:
         df_aire_total = pd.concat([df_aire_total, df_hoja], axis=0)
 
-# Calcular peor categoria por hora a nivel global (opcional, se puede hacer despues)
-# Pero para mantener la columna, la calculamos sobre el total
+# Calcular calidad global para la hoja General (sin umbral, con todas las categorias)
 if not df_aire_total.empty:
-    # Extraer columnas de categoria (empiezan con AIRE_)
-    cols_cat = [c for c in df_aire_total.columns if c.startswith('AIRE_') and not c.startswith('AIRE_O3')]  # cuidado: asi tomamos todas
-    # Mas simple: todas las que empiezan con AIRE_ y no son CANTIDAD_
     cols_cat = [c for c in df_aire_total.columns if c.startswith('AIRE_') and 'CANTIDAD' not in c]
     if cols_cat:
         series_cat = [df_aire_total[col] for col in cols_cat]
-        df_aire_total['Calidad del aire'] = peor_categoria(series_cat)
+        # Para la hoja General, no aplicamos umbral (o aplicamos uno muy bajo)
+        # Usamos la misma funcion pero con umbral 0 para que siempre calcule
+        df_aire_total['Calidad del aire'] = peor_categoria(series_cat, 0.0)
 
-# Consolidar con existente
-df_aire_total = combinar_con_existente(df_aire_total, salida_aire, col_fecha='Fecha & Hora')
-# Identificar columnas de categoria para colorear (para el formato)
-columnas_categoria = [c for c in df_aire_total.columns if c.startswith('AIRE_') and 'CANTIDAD' not in c]
-if 'Calidad del aire' in df_aire_total.columns:
-    columnas_categoria.append('Calidad del aire')
-guardar_con_formato(df_aire_total, salida_aire, col_fecha='Fecha & Hora',
-                    colores_dict=COLORES_NOM, columnas_color=columnas_categoria)
-print("Archivo AIRE Y SALUD horario generado/actualizado.")
+# Combinar con existente
+df_aire_general = combinar_con_existente(df_aire_total, salida_aire, 'General', 'Fecha & Hora')
+# Extraer hojas por estacion (con su propia calidad)
+diccionario_aire = {'General': df_aire_general}
+diccionario_aire.update(extraer_estaciones(df_aire_general, 'AIRE'))
+guardar_diccionario_excel(salida_aire, diccionario_aire, 'AIRE')
+print("Archivo AIRE Y SALUD horario generado/actualizado con hojas por estacion.")
 
 # ----------------------------------------------------------------------------
 # 3. Generar datos para DIARIO (NOM-172)
@@ -422,53 +518,20 @@ for hoja in xls.sheet_names:
         df_dia[col_cat] = categorias
         df_dia[col_conc] = valor_redondeado.values
 
-    # Eliminar filas completamente vacias
     df_dia = df_dia.dropna(how='all')
     if not df_dia.empty:
         df_diario_total = pd.concat([df_diario_total, df_dia], axis=0)
 
-# Calcular peor categoria diaria
+# Calcular calidad global diaria para hoja General
 if not df_diario_total.empty:
     cols_cat = [c for c in df_diario_total.columns if c.startswith('AIRE_') and 'CANTIDAD' not in c]
     if cols_cat:
         series_cat = [df_diario_total[col] for col in cols_cat]
-        df_diario_total['Calidad del aire'] = peor_categoria(series_cat)
+        df_diario_total['Calidad del aire'] = peor_categoria(series_cat, 0.0)
 
-# Consolidar con existente (el diario tiene indice de fecha, pero la columna se llama 'Fecha')
-df_diario_total.index.name = 'Fecha'
-df_diario_total = combinar_con_existente(df_diario_total, salida_diario, col_fecha='Fecha')
-# Para guardar, necesitamos resetear el indice? No, guardaremos con indice
-with pd.ExcelWriter(salida_diario, engine='openpyxl') as writer:
-    df_diario_total.to_excel(writer, sheet_name='Datos', index=True)
-# Aplicar formato similar (sin colores de cantidad porque no hay columnas CANTIDAD_ en diario? Si las hay)
-guardar_con_formato(df_diario_total, salida_diario, col_fecha='Fecha',
-                    colores_dict=COLORES_NOM, columnas_color=[c for c in df_diario_total.columns if c.startswith('AIRE_') or c=='Calidad del aire'],
-                    es_diario=True)
-print("Archivo DIARIO generado/actualizado.")
-
-# ----------------------------------------------------------------------------
-# 4. Generar archivo con hojas por estacion (para AIRE Y SALUD horario)
-# ----------------------------------------------------------------------------
-print("Generando archivo por estacion...")
-if not df_aire_total.empty:
-    # Obtener lista de estaciones unicas a partir de los nombres de columna
-    estaciones_unicas = set()
-    for col in df_aire_total.columns:
-        if col.startswith('AIRE_') and 'CANTIDAD' not in col:
-            # Formato: AIRE_contaminante_estacion
-            partes = col.split('_')
-            if len(partes) >= 3:
-                estacion = '_'.join(partes[2:])  # puede tener espacios? asumimos que el ultimo es la estacion
-                estaciones_unicas.add(estacion)
-    with pd.ExcelWriter(salida_por_estacion, engine='openpyxl') as writer:
-        # Hoja general con todos los datos
-        df_aire_total.to_excel(writer, sheet_name='Todas', index=True)
-        # Hoja por estacion
-        for estacion in sorted(estaciones_unicas):
-            cols_estacion = [c for c in df_aire_total.columns if c.endswith(estacion) or (c=='Fecha & Hora') or (c=='Calidad del aire')]
-            # Incluir tambien las columnas de cantidad correspondientes
-            df_estacion = df_aire_total[cols_estacion].copy()
-            df_estacion.to_excel(writer, sheet_name=estacion[:31], index=True)  # limite de nombre de hoja Excel
-    print("Archivo por estacion generado.")
-else:
-    print("No hay datos para generar archivo por estacion.")
+# Combinar con existente
+df_diario_general = combinar_con_existente(df_diario_total, salida_diario, 'General', 'Fecha')
+diccionario_diario = {'General': df_diario_general}
+diccionario_diario.update(extraer_estaciones(df_diario_general, 'DIARIO'))
+guardar_diccionario_excel(salida_diario, diccionario_diario, 'DIARIO')
+print("Archivo DIARIO generado/actualizado con hojas por estacion.")
