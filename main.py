@@ -107,13 +107,28 @@ def obtener_color_ica(valor):
     return None
 
 def preparar_datos_hoja(df):
-    """Convierte las primeras filas en metadatos y reindexa a frecuencia horaria.
-       Maneja correctamente las horas 24:00 convirtiéndolas a 00:00 del día siguiente.
     """
-    estaciones = df.iloc[0].values
-    contaminantes = df.iloc[1].values
-    unidades = df.iloc[2].values
-    datos_raw = df.iloc[3:].reset_index(drop=True)
+    Convierte las primeras filas en metadatos y reindexa a frecuencia horaria.
+    Detecta automáticamente la fila que contiene 'Fecha & Hora' para ubicar los encabezados.
+    Maneja correctamente las horas 24:00 convirtiéndolas a 00:00 del día siguiente.
+    """
+    # Buscar la fila que contiene 'Fecha & Hora' en la primera columna
+    start_row = None
+    for idx, row in df.iterrows():
+        if isinstance(row[0], str) and 'Fecha & Hora' in row[0]:
+            start_row = idx
+            break
+    if start_row is None:
+        # Si no se encuentra, asumir el formato original (filas 0,1,2 como encabezados)
+        start_row = 0
+        print("ADVERTENCIA: No se encontró la fila 'Fecha & Hora'. Usando formato por defecto.")
+
+    # Las filas de metadatos son: start_row (encabezado de columna), start_row+1 (estaciones), start_row+2 (contaminantes), start_row+3 (unidades)
+    # Los datos comienzan en start_row+4
+    estaciones = df.iloc[start_row+1].values
+    contaminantes = df.iloc[start_row+2].values
+    unidades = df.iloc[start_row+3].values
+    datos_raw = df.iloc[start_row+4:].reset_index(drop=True)
 
     dates_raw = datos_raw.iloc[:, 0].astype(str)
     # Dividir fecha y hora
@@ -134,21 +149,28 @@ def preparar_datos_hoja(df):
     else:
         dates = pd.to_datetime(dates_raw, errors='coerce', dayfirst=True)
 
-    if dates.isna().any():
-        print(f"ADVERTENCIA: {dates.isna().sum()} filas con fecha no valida seran descartadas.")
-        datos_raw = datos_raw.loc[~dates.isna()]
-        dates = dates[~dates.isna()]
+    # Identificar fechas no válidas
+    invalid_mask = dates.isna()
+    if invalid_mask.any():
+        print(f"ADVERTENCIA: {invalid_mask.sum()} filas con fecha no válida serán descartadas.")
+        invalid_examples = dates_raw[invalid_mask].unique()[:10]
+        print("Fechas inválidas:", invalid_examples.tolist())
+        datos_raw = datos_raw.loc[~invalid_mask]
+        dates = dates[~invalid_mask]
+
     datos_raw.index = dates
     datos_raw.index.name = 'Fecha'
     datos_raw = datos_raw.drop(columns=0)
     if datos_raw.index.duplicated().any():
-        print(f"ADVERTENCIA: {datos_raw.index.duplicated().sum()} indices duplicados; se conserva la primera ocurrencia.")
+        print(f"ADVERTENCIA: {datos_raw.index.duplicated().sum()} índices duplicados; se conserva la primera ocurrencia.")
         datos_raw = datos_raw[~datos_raw.index.duplicated(keep='first')]
     full_range = pd.date_range(start=datos_raw.index.min(), end=datos_raw.index.max(), freq='h')
     data_df = datos_raw.reindex(full_range)
     gaps = full_range.difference(data_df.index)
     if len(gaps) > 0:
         print(f"INFO: Se agregaron {len(gaps)} horas faltantes (NaN).")
+    print("Fechas en la hoja:", data_df.index.min(), "a", data_df.index.max())
+    print("Número de filas:", len(data_df))
     return estaciones, contaminantes, unidades, data_df, len(df.columns)
 
 def peor_categoria(series_categorias, umbral_suficiencia=0.75):
@@ -486,6 +508,7 @@ for hoja in xls.sheet_names:
 
 # Combinar con existente (hoja General)
 df_ica_general = combinar_con_existente(df_ica_total, salida_ica, 'General', 'Fecha & Hora')
+print("Rango de fechas ICA después de combinar:", df_ica_general.index.min(), "a", df_ica_general.index.max())
 # Reordenar columnas de ICA
 df_ica_general = df_ica_general[ordenar_columnas_ica(df_ica_general)]
 
@@ -515,6 +538,9 @@ print("Procesando datos para AIRE Y SALUD horario...")
 df_aire_total = pd.DataFrame()
 
 for hoja in xls.sheet_names:
+    print(f"\n--- Procesando hoja: {hoja} ---")
+    print("Rango de fechas en data_df:", data_df.index.min(), "a", data_df.index.max())
+    print("Número de filas en data_df:", len(data_df))
     df = pd.read_excel(xls, sheet_name=hoja, header=None)
     estaciones, contaminantes, unidades, data_df, num_orig_cols = preparar_datos_hoja(df)
 
@@ -566,6 +592,12 @@ for hoja in xls.sheet_names:
         df_hoja[col_conc] = conc_redondeada
 
     df_hoja = df_hoja.dropna(how='all')
+    print("df_hoja tiene", len(df_hoja), "filas. Rango:", df_hoja.index.min(), "a", df_hoja.index.max())
+    if not df_hoja.empty:
+        print("Primeras 2 filas de df_hoja:")
+        print(df_hoja.head(2))
+    else:
+        print("df_hoja está vacío para esta hoja.")
     if not df_hoja.empty:
         df_aire_total = pd.concat([df_aire_total, df_hoja], axis=0)
 
