@@ -171,22 +171,31 @@ def peor_categoria(series_categorias, umbral_suficiencia=0.75):
     inverso = {v: k for k, v in ORDEN_CATEGORIAS.items()}
     return max_num.map(inverso).where(max_num >= 0, None)
 
-def combinar_con_existente(df_nuevo, archivo, nombre_hoja, col_fecha):
+def combinar_con_existente(df_nuevo, archivo, nombre_hoja, col_fecha, es_diario=False):
     """
     Lee la hoja 'nombre_hoja' del archivo existente (si existe) y la combina con df_nuevo.
-    Convierte el indice a Timestamp si es necesario.
+    Si es_diario=True, se espera que la fecha esté en una columna (no como índice) y se convertirá a índice para la combinación.
     """
     if os.path.exists(archivo):
         try:
-            df_existente = pd.read_excel(archivo, sheet_name=nombre_hoja, engine='openpyxl')
-            if col_fecha in df_existente.columns:
-                df_existente.set_index(col_fecha, inplace=True)
-            else:
-                df_existente.set_index(df_existente.columns[0], inplace=True)
+            if es_diario:
+                # Leer sin índice, la fecha estará en una columna
+                df_existente = pd.read_excel(archivo, sheet_name=nombre_hoja, engine='openpyxl', index_col=None)
+                # Buscar la columna de fecha (debería ser la primera o llamarse 'Fecha')
+                if col_fecha in df_existente.columns:
+                    fecha_col = col_fecha
+                else:
+                    fecha_col = df_existente.columns[0]
+                # Convertir a datetime y establecer como índice
+                df_existente[fecha_col] = pd.to_datetime(df_existente[fecha_col])
+                df_existente.set_index(fecha_col, inplace=True)
                 df_existente.index.name = col_fecha
-            # Convertir indice a Timestamp si es date
-            if not isinstance(df_existente.index, pd.DatetimeIndex):
-                df_existente.index = pd.to_datetime(df_existente.index)
+            else:
+                # Leer con índice
+                df_existente = pd.read_excel(archivo, sheet_name=nombre_hoja, engine='openpyxl', index_col=0)
+                if not isinstance(df_existente.index, pd.DatetimeIndex):
+                    df_existente.index = pd.to_datetime(df_existente.index)
+            # Combinar
             df_combinado = pd.concat([df_existente, df_nuevo], axis=0, sort=False)
             df_combinado = df_combinado[~df_combinado.index.duplicated(keep='last')]
             df_combinado.sort_index(inplace=True)
@@ -195,8 +204,8 @@ def combinar_con_existente(df_nuevo, archivo, nombre_hoja, col_fecha):
             print(f"Advertencia: No se pudo leer hoja '{nombre_hoja}' de {archivo}. Se creara nueva. Error: {e}")
             return df_nuevo
     else:
-        return df_nuevo
-    
+        return df_nuevo  
+
 def ordenar_columnas_aire(df):
     """
     Reordena las columnas de un DataFrame de AIRE Y SALUD para que queden intercaladas:
@@ -204,7 +213,7 @@ def ordenar_columnas_aire(df):
     y luego la de cantidad (CANTIDAD_*), y al final 'Calidad del aire' si existe.
     """
     # Extraer todos los pares (contaminante, estacion) de las columnas que empiezan con AIRE_ y no son CANTIDAD
-    patron = re.compile(r'^AIRE_(\w+)_(.+)$')
+    patron = re.compile(r'^AIRE_([^_]+)_(.+)$')
     pares = set()
     for col in df.columns:
         if col.startswith('AIRE_') and 'CANTIDAD' not in col:
@@ -215,7 +224,6 @@ def ordenar_columnas_aire(df):
                 pares.add((contaminante, estacion))
     # Ordenar pares por estacion y luego contaminante
     pares_ordenados = sorted(pares, key=lambda x: (x[1], x[0]))
-    # Construir lista de columnas intercaladas
     cols_ordenadas = []
     for contaminante, estacion in pares_ordenados:
         col_cat = f"AIRE_{contaminante}_{estacion}"
@@ -224,10 +232,8 @@ def ordenar_columnas_aire(df):
             cols_ordenadas.append(col_cat)
         if col_cant in df.columns:
             cols_ordenadas.append(col_cant)
-    # Añadir Calidad del aire si existe
     if 'Calidad del aire' in df.columns:
         cols_ordenadas.append('Calidad del aire')
-    # Asegurar que no falten columnas (las que no estén en la lista se añaden al final)
     resto = [c for c in df.columns if c not in cols_ordenadas]
     return cols_ordenadas + resto
 
@@ -237,7 +243,7 @@ def ordenar_columnas_ica(df):
     Las columnas tienen formato ICA_contaminante_estacion.
     """
     # Extraer todos los pares (contaminante, estacion)
-    patron = re.compile(r'^ICA_(\w+)_(.+)$')
+    patron = re.compile(r'^ICA_([^_]+)_(.+)$')
     pares = set()
     for col in df.columns:
         m = patron.match(col)
@@ -258,7 +264,7 @@ def extraer_estaciones(df, tipo):
     devuelve un diccionario {nombre_estacion: DataFrame_con_columnas_de_esa_estacion}.
     Incluye la columna de fecha (indice). La columna 'Calidad del aire' se recalcula por estacion.
     """
-    # Obtener lista de estaciones unicas
+    # Obtener lista de estaciones unicas usando expresion regular
     estaciones = set()
     for col in df.columns:
         if tipo == 'ICA' and col.startswith('ICA_'):
@@ -266,17 +272,26 @@ def extraer_estaciones(df, tipo):
             if len(partes) >= 3:
                 est = '_'.join(partes[2:])
                 estaciones.add(est)
-        elif tipo in ['AIRE', 'DIARIO'] and col.startswith('AIRE_'):
+        elif tipo in ['AIRE', 'DIARIO'] and (col.startswith('AIRE_') or col.startswith('CANTIDAD_')):
             partes = col.split('_')
             if len(partes) >= 3:
+                # El último elemento después de '_' puede ser la estación compuesta
                 est = '_'.join(partes[2:])
                 estaciones.add(est)
 
     dfs_estacion = {}
     for est in sorted(estaciones):
-        # Columnas de categoria y cantidad que terminan con esta estacion
-        cols_cat = [c for c in df.columns if c.endswith(est) and 'CANTIDAD' not in c and c.startswith('AIRE_')]
-        cols_cant = [c for c in df.columns if c.endswith(est) and 'CANTIDAD' in c]
+        # Escapar el nombre de la estacion para usarlo en regex
+        est_esc = re.escape(est)
+        # Columnas de categoria y cantidad que corresponden a esta estacion
+        cols_cat = []
+        cols_cant = []
+        for col in df.columns:
+            if col.endswith(est):
+                if col.startswith('AIRE_'):
+                    cols_cat.append(col)
+                elif col.startswith('CANTIDAD_'):
+                    cols_cant.append(col)
         # Crear DataFrame con esas columnas
         df_est = df[cols_cat + cols_cant].copy()
         # Calcular calidad del aire para esta estacion
@@ -284,10 +299,10 @@ def extraer_estaciones(df, tipo):
             series_cat = [df_est[col] for col in cols_cat]
             df_est['Calidad del aire'] = peor_categoria(series_cat, SUFICIENCIA)
         # Reordenar columnas de la estacion para que queden intercaladas
-        patron = re.compile(r'^AIRE_(\w+)_' + re.escape(est) + r'$')
+        # Extraer pares (contaminante) de las columnas de categoria
         pares = []
         for col in cols_cat:
-            m = patron.match(col)
+            m = re.match(r'^AIRE_([^_]+)_' + est_esc + r'$', col)
             if m:
                 contaminante = m.group(1)
                 pares.append(contaminante)
@@ -382,13 +397,19 @@ def guardar_diccionario_excel(archivo, diccionario_dfs, tipo, nombre_indice):
     """
     with pd.ExcelWriter(archivo, engine='openpyxl') as writer:
         for nombre_hoja, df in diccionario_dfs.items():
-            # Asegurar que el índice sea datetime y asignar nombre
-            df.index = pd.to_datetime(df.index)
-            df.index.name = nombre_indice
             # Limitar nombre de hoja a 31 caracteres
             nombre_hoja = nombre_hoja[:31]
-            df.to_excel(writer, sheet_name=nombre_hoja, index=True)
-
+            if tipo == 'DIARIO':
+                # Para diario, resetear índice y formatear la columna de fecha
+                df_export = df.reset_index()
+                df_export.rename(columns={'index': nombre_indice}, inplace=True)
+                # Convertir la columna de fecha a string sin hora
+                df_export[nombre_indice] = df_export[nombre_indice].dt.strftime('%Y-%m-%d')
+                df_export.to_excel(writer, sheet_name=nombre_hoja, index=False)
+            else:
+                # Para horarios, guardar con índice (fecha con hora)
+                df.index.name = nombre_indice
+                df.to_excel(writer, sheet_name=nombre_hoja, index=True)
     # Aplicar formato a cada hoja
     wb = load_workbook(archivo)
     for nombre_hoja in wb.sheetnames:
@@ -442,7 +463,7 @@ for hoja in xls.sheet_names:
             status_str = status_series.astype(str).str.strip().str.lower()
             valores = valores.where(status_str == "ok", np.nan)
 
-        valores = valores.where(valores >= 0, np.nan)
+        valores = valores.where(valores > 0, np.nan)
 
         if (valores == 0).all():
             print(f"ADVERTENCIA: {contaminante} en {estacion} tiene todos los valores en 0.")
@@ -643,7 +664,7 @@ if not df_diario_total.empty:
         df_diario_total['Calidad del aire'] = peor_categoria(series_cat, 0.0)
 
 # Combinar con existente
-df_diario_general = combinar_con_existente(df_diario_total, salida_diario, 'General', 'Fecha')
+df_diario_general = combinar_con_existente(df_diario_total, salida_diario, 'General', 'Fecha', es_diario=True)
 # Reordenar columnas de DIARIO (misma logica que AIRE)
 df_diario_general = df_diario_general[ordenar_columnas_aire(df_diario_general)]
 
